@@ -169,6 +169,7 @@ class DVSPortal:
             "reservation/create",
             headers=authorization_header,
             json={
+                "DateFrom": datetime.now().isoformat(),
                 "LicensePlate": {
                     "Value": license_plate_value,
                     "Name": license_plate_name
