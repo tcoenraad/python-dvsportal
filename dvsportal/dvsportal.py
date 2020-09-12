@@ -60,7 +60,7 @@ class DVSPortal:
         if self.user_agent is None:
             self.user_agent = "PythonDVSPortal/{}".format(__version__)
 
-    async def _request(self, uri: str, method: str = "POST", data={}, headers={}):
+    async def _request(self, uri: str, method: str = "POST", json={}, headers={}):
         """Handle a request to DVSPortal."""
         url = URL.build(
             scheme="https", host=self.api_host, port=443, path=API_BASE_URI
@@ -68,13 +68,12 @@ class DVSPortal:
 
         default_headers = {
             "User-Agent": self.user_agent,
-            "Accept": "application/json",
         }
 
         try:
             with async_timeout.timeout(self.request_timeout):
                 response = await self._session.request(
-                    method, url, data=data, headers={**default_headers, **headers}, ssl=True
+                    method, url, json=json, headers={**default_headers, **headers}, ssl=True
                 )
         except asyncio.TimeoutError as exception:
             raise DVSPortalConnectionError(
@@ -86,51 +85,55 @@ class DVSPortal:
             ) from exception
 
         content_type = response.headers.get("Content-Type", "")
-        if (response.status // 100) in [4, 5]:
-            contents = await response.read()
-            response.close()
 
-            if content_type == "application/json":
-                raise DVSPortalError(
-                    response.status, json.loads(contents.decode("utf8"))
-                )
+        if not content_type.startswith("application/json"):
+            response_text = await response.text()
             raise DVSPortalError(
-                response.status, {"message": contents.decode("utf8")}
+                response.status, {"message": response_text}
             )
 
-        if "application/json" in response.headers["Content-Type"]:
-            return await response.json()
-        return await response.text()
+        response_json = await response.json()
+        if (response.status // 100) in [4, 5] or "ErrorMessage" in response_json:
+            raise DVSPortalError(
+                response.status, response_json
+            )
+
+        return response_json
 
     async def token(self) -> Optional[int]:
         """Return token."""
         if self._token is None:
             response = await self._request(
                 "login",
-                data={
+                json={
                     "identifier": self._identifier,
                     "loginMethod": "Pas",
                     "password": self._password,
                     "permitMediaTypeID": 1}
             )
-            if "ErrorMessage" in response:
-                raise DVSPortalAuthError(response["ErrorMessage"])
             self._token = response["Token"]
         return self._token
+
+    async def authorization_header(self):
+        await self.token()
+        return {
+            "Authorization": "Token " + str(base64.b64encode(self._token.encode("utf-8")), "utf-8")
+        }
 
     async def update(self) -> None:
         """Fetch data from DVSPortal."""
         await self.token()
 
+        authorization_header = await self.authorization_header()
         response = await self._request(
             "login/getbase",
-            headers={
-              "Authorization": "Token " + str(base64.b64encode(self._token.encode("utf-8")), "utf-8")
-            }
+            headers=authorization_header
         )
 
-        permit_medias = [item for sublist in response["Permits"] for item in sublist["PermitMedias"]]
+        permit_medias = [item for sublist in response["Permits"]
+                         for item in sublist["PermitMedias"]]
         self._permits = [{
+            "type_id": permit["TypeID"],
             "code": permit["Code"],
             "zone_code": permit["ZoneCode"],
             "license_plates": {
@@ -144,6 +147,36 @@ class DVSPortal:
                     "license_plate": reservation["LicensePlate"]["Value"]
                 } for reservation in permit["ActiveReservations"]]
         } for permit in permit_medias]
+
+    async def end_reservation(self, type_id=None, code=None, reservation_id=None):
+        """Ends reservation"""
+        authorization_header = await self.authorization_header()
+
+        return await self._request(
+            "reservation/end",
+            headers=authorization_header,
+            json={
+                "ReservationID": reservation_id,
+                "permitMediaTypeID": type_id,
+                "permitMediaCode": code
+            }
+        )
+
+    async def create_reservation(self, license_plate_value=None, license_plate_name=None, type_id=None, code=None):
+        authorization_header = await self.authorization_header()
+
+        return await self._request(
+            "reservation/create",
+            headers=authorization_header,
+            json={
+                "LicensePlate": {
+                    "Value": license_plate_value,
+                    "Name": license_plate_name
+                },
+                "permitMediaTypeID": type_id,
+                "permitMediaCode": code
+            }
+        )
 
     async def permits(self):
         """Return active permits"""
